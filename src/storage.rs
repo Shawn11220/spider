@@ -1,7 +1,9 @@
-/// Represents a "Row" in the Fixed-Size Index.
+use serde::{Serialize, Deserialize};
+
+/// Fixed-size metadata for a node.
 /// This struct is designed to be FFI-safe and memory efficient.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NodeHeader {
     /// Unique identifier for the node.
     pub id: u64,

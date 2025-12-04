@@ -3,6 +3,19 @@ use crate::search;
 use crate::storage::NodeHeader;
 use pyo3::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Serialize, Deserialize};
+use std::fs::File;
+use std::path::Path;
+use std::io::{BufReader, BufWriter};
+
+// SNAPSHOT: Stores data, BUT NOT the Index (we rebuild it)
+#[derive(Serialize, Deserialize)]
+struct SpiderSnapshot {
+    headers: Vec<NodeHeader>,
+    data_heap: Vec<u8>,
+    edge_list: Vec<Vec<u64>>,
+    embeddings: Vec<Vec<f32>>,
+}
 
 /// The main database struct holding all data arenas.
 #[pyclass]
@@ -17,6 +30,8 @@ pub struct SpiderDB {
     embeddings: Vec<Vec<f32>>,
     /// HNSW Index for fast approximate nearest neighbor search.
     index: search::VectorIndex,
+    /// Path to the database file.
+    file_path: Option<String>,
 }
 
 #[pymethods]
@@ -24,21 +39,50 @@ impl SpiderDB {
     // The #[new] macro handles Python arguments
     #[new]
     pub fn new(
+        db_path: Option<String>,
         max_capacity: Option<usize>,
         m: Option<usize>,
         ef_construction: Option<usize>
-    ) -> Self {
+    ) -> PyResult<Self> {
+        let db_path = db_path.unwrap_or("./spider.db".to_string());
+        
+        // --- 1. TRY LOADING FROM DISK ---
+        if Path::new(&db_path).exists() {
+            // Load Data
+            let file = File::open(&db_path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let reader = BufReader::new(file);
+            let snapshot: SpiderSnapshot = bincode::deserialize_from(reader)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to load DB: {}", e)))?;
+
+            // REBUILD INDEX (The Fix)
+            // We create a fresh index and re-insert all vectors.
+            let index = search::VectorIndex::new(m, max_capacity, ef_construction);
+            for (i, vec) in snapshot.embeddings.iter().enumerate() {
+                index.add(i as u64, vec);
+            }
+
+            return Ok(SpiderDB {
+                headers: snapshot.headers,
+                data_heap: snapshot.data_heap,
+                edge_list: snapshot.edge_list,
+                embeddings: snapshot.embeddings,
+                index, // Rebuilt index
+                file_path: Some(db_path),
+            });
+        }
+
+        // --- 2. START FRESH (RAM or New File) ---
         // We don't even need to unwrap here if we pass Options down to search.rs
         // But for vectors, we usually want to reserve capacity immediately.
         let cap = max_capacity.unwrap_or(1_000_000);
-
-        SpiderDB {
+        Ok(SpiderDB {
             headers: Vec::with_capacity(cap),
             data_heap: Vec::with_capacity(cap * 100),
             edge_list: Vec::with_capacity(cap),
             embeddings: Vec::with_capacity(cap),
             index: search::VectorIndex::new(m, max_capacity, ef_construction),
-        }
+            file_path: Some(db_path), // Remember the path (even if it doesn't exist yet)
+        })
     }
 
     /// Adds a new node to the database.
@@ -199,5 +243,36 @@ impl SpiderDB {
             return 0.0;
         }
         bio::calc_life_score(&self.headers[id as usize])
+    }
+
+    /// Saves the database.
+    ///
+    /// # Arguments
+    /// * `path` (Optional) - If provided, saves to this new path.
+    ///                       If None, saves to the path provided at init.
+    pub fn save(&self, path: Option<String>) -> PyResult<()> {
+        // Determine target path: Argument > Init Path > Error
+        let target_path = match path {
+            Some(p) => p,
+            None => match &self.file_path {
+                Some(p) => p.clone(),
+                None => return Err(pyo3::exceptions::PyValueError::new_err("No path specified for save() and no db_path provided at init.")),
+            },
+        };
+
+        let snapshot = SpiderSnapshot {
+            headers: self.headers.clone(),
+            data_heap: self.data_heap.clone(),
+            edge_list: self.edge_list.clone(),
+            embeddings: self.embeddings.clone(),
+        };
+
+        let file = File::create(&target_path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let writer = BufWriter::new(file);
+        
+        bincode::serialize_into(writer, &snapshot)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            
+        Ok(())
     }
 }
