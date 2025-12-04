@@ -1,47 +1,41 @@
 import spider
 import time
 
-print("🕷️  Initializing Spider Brain...")
-db = spider.SpiderDB()
+def test_modular_architecture():
+    print("--- Testing Modular Architecture ---")
+    db = spider.SpiderDB()
+    
+    # 1. Add Nodes
+    id1 = db.add_node("Node A", [0.1]*384, 10)
+    id2 = db.add_node("Node B", [0.1]*384, 5)
+    id3 = db.add_node("Node C", [0.1]*384, 1)
+    print(f"Added nodes: {id1}, {id2}, {id3}")
+    
+    # 2. Add Edge (Mocked)
+    db.add_edge(id1, id2)
+    print("Added edge from Node A to Node B")
+    
+    # 3. Hybrid Search
+    # Create a dummy query vector (size 384)
+    query = [0.1] * 384
+    results = db.hybrid_search(query, 2)
+    print(f"Hybrid Search Results: {results}")
+    
+    # 4. Vacuum
+    dead = db.vacuum(5.0)
+    print(f"Vacuum (Threshold 5.0): {dead}")
+    
+    # Node C (Sig 1) should be dead. Node A (Sig 10) and B (Sig 5) should live.
+    # Note: Time delta is 0, so score is roughly (Sig * 10) / 3.48
+    # A: 100 / 3.48 = 28.7
+    # B: 50 / 3.48 = 14.3
+    # C: 10 / 3.48 = 2.87
+    
+    assert id3 in dead, "Node C should be dead"
+    assert id1 not in dead, "Node A should be alive"
+    assert id2 not in dead, "Node B should be alive"
+    
+    print("SUCCESS: Modular architecture verified!")
 
-# 1. Add a "Trivial" Node (Meme)
-# Significance = 1 (Low), Dummy Vector = [0.0, 0.0]
-meme_id = db.add_node("Funny Cat Meme", [0.0, 0.0], 1)
-print(f"➕ Added Meme (ID: {meme_id}) | Significance: 1")
-
-# 2. Add a "Critical" Node (Password)
-# Significance = 100 (High)
-pass_id = db.add_node("Bank Password: 123", [1.0, 1.0], 100)
-print(f"➕ Added Password (ID: {pass_id}) | Significance: 100")
-
-# 3. Simulate Usage
-# We read the Password (Reinforcing it)
-print("\n👀 Reading Password Node...")
-content = db.get_node(pass_id)
-print(f"   Retrieved: {content}")
-
-# We DO NOT read the Meme (It starts decaying immediately)
-
-# 4. Check Life Scores
-print("\n📊 Calculating Life Scores...")
-meme_score = db.calculate_life_score(meme_id)
-pass_score = db.calculate_life_score(pass_id)
-
-print(f"   Meme Score: {meme_score:.4f} (Should be low)")
-print(f"   Pass Score: {pass_score:.4f} (Should be high)")
-
-# 5. Run Vacuum (Pruning)
-# Threshold is set to 5.0. 
-# The Meme (Score ~3.0) should die. The Password (Score ~200) should live.
-print("\n🧹 Running Vacuum (Threshold: 5.0)...")
-dead_nodes = db.vacuum(5.0)
-
-if meme_id in dead_nodes:
-    print("✅ SUCCESS: The Meme was correctly pruned.")
-else:
-    print("❌ FAILURE: The Meme survived (Check logic).")
-
-if pass_id not in dead_nodes:
-    print("✅ SUCCESS: The Password survived.")
-else:
-    print("❌ FAILURE: The Password was deleted (Check logic).")
+if __name__ == "__main__":
+    test_modular_architecture()
