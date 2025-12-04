@@ -15,6 +15,8 @@ pub struct SpiderDB {
     edge_list: Vec<u64>,
     /// Vector embeddings for nodes.
     embeddings: Vec<Vec<f32>>,
+    /// HNSW Index for fast approximate nearest neighbor search.
+    index: search::VectorIndex,
 }
 
 #[pymethods]
@@ -26,6 +28,7 @@ impl SpiderDB {
             data_heap: Vec::new(),
             edge_list: Vec::new(),
             embeddings: Vec::new(),
+            index: search::VectorIndex::new(),
         }
     }
 
@@ -47,6 +50,11 @@ impl SpiderDB {
         let data_len = data_bytes.len() as u32;
 
         self.data_heap.extend_from_slice(data_bytes);
+        
+        // Add to HNSW Index
+        self.index.add(id, &embedding);
+        
+        // Keep raw embeddings for now (optional, but good for debugging)
         self.embeddings.push(embedding);
 
         let header = NodeHeader {
@@ -148,11 +156,12 @@ impl SpiderDB {
     ///
     /// * `Vec<u64>` - List of top-k node IDs.
     pub fn hybrid_search(&self, query_embedding: Vec<f32>, k: usize) -> Vec<u64> {
-        let similar = search::find_similar_vectors(&query_embedding, &self.embeddings, k * 2);
+        // Use HNSW Index for search
+        let similar = self.index.search(&query_embedding, k * 2);
         
         // Re-rank using Life Score
-        let mut ranked: Vec<(u64, f32)> = similar.into_iter().map(|(idx, sim_score)| {
-            let id = idx as u64;
+        let mut ranked: Vec<(u64, f32)> = similar.into_iter().map(|(id, sim_score)| {
+            let idx = id as usize;
             let life_score = bio::calc_life_score(&self.headers[idx]);
             // Simple hybrid score: Similarity * LifeScore
             (id, sim_score * life_score)

@@ -1,47 +1,48 @@
-use rayon::prelude::*;
+use hnsw_rs::prelude::*;
 
-/// Calculates the cosine similarity between two vectors.
-///
-/// # Arguments
-///
-/// * `a` - First vector.
-/// * `b` - Second vector.
-///
-/// # Returns
-///
-/// * `f32` - Cosine similarity score.
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot_product: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+/// A wrapper around the HNSW index.
+pub struct VectorIndex {
+    index: Hnsw<'static, f32, DistCosine>,
+}
 
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
+impl VectorIndex {
+    /// Creates a new HNSW index.
+    pub fn new() -> Self {
+        let max_nb_connection = 16;
+        let max_elements = 10_000; // Initial capacity
+        let max_layer = 16;
+        let ef_construction = 200;
+
+        let index = Hnsw::new(
+            max_nb_connection, 
+            max_elements, 
+            max_layer, 
+            ef_construction, 
+            DistCosine
+        );
+        
+        VectorIndex { index }
     }
 
-    dot_product / (norm_a * norm_b)
+    /// Adds a vector to the index.
+    pub fn add(&self, id: u64, vector: &[f32]) {
+        // hnsw_rs uses usize for ID. We cast u64 to usize.
+        // Ensure ID fits in usize (safe on 64-bit systems).
+        self.index.insert((vector, id as usize));
+    }
+
+    /// Searches for the nearest neighbors.
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let ef_search = 64; // Search parameter
+        let results = self.index.search(query, k, ef_search);
+        
+        // hnsw_rs returns (Neighbor { d_id, distance, ... })
+        // We want (id, similarity).
+        // DistCosine in hnsw_rs usually returns Cosine Distance (0 to 2).
+        // Similarity = 1.0 - Distance.
+        
+        results.into_iter().map(|neighbor| {
+            (neighbor.d_id as u64, 1.0 - neighbor.distance)
+        }).collect()
+    }
 }
-
-/// Finds the top-k most similar vectors to the query.
-///
-/// # Arguments
-///
-/// * `query` - The query vector.
-/// * `embeddings` - List of all embeddings.
-/// * `k` - Number of results to return.
-///
-/// # Returns
-///
-/// * `Vec<(usize, f32)>` - List of (index, score) tuples.
-pub fn find_similar_vectors(query: &[f32], embeddings: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
-    let mut scores: Vec<(usize, f32)> = embeddings
-        .par_iter()
-        .enumerate()
-        .map(|(i, embedding)| (i, cosine_similarity(query, embedding)))
-        .collect();
-
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    scores.into_iter().take(k).collect()
-}
-
-// TODO: Integrate usearch crate for HNSW indexing in Phase 2.
