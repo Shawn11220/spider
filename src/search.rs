@@ -50,3 +50,16 @@ impl VectorIndex {
         }).collect()
     }
 }
+
+/// Calculates the cosine similarity between two vectors.
+pub fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
+    let dot_product: f32 = v1.iter().zip(v2).map(|(a, b)| a * b).sum();
+    let norm_a: f32 = v1.iter().map(|a| a * a).sum::<f32>().sqrt();
+    let norm_b: f32 = v2.iter().map(|b| b * b).sum::<f32>().sqrt();
+    
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    
+    dot_product / (norm_a * norm_b)
+}
