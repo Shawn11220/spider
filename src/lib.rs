@@ -4,6 +4,8 @@ pub mod bio;
 pub mod db;
 pub mod search;
 pub mod storage;
+pub mod cluster;
+pub mod ranking;
 
 use db::SpiderDB;
 

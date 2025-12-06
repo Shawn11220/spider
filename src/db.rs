@@ -1,6 +1,8 @@
 use crate::bio;
 use crate::search;
 use crate::storage::NodeHeader;
+use crate::cluster::{ClusterEngine, ClusterConfig, Cluster};
+use crate::ranking;
 use pyo3::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
@@ -15,6 +17,8 @@ struct SpiderSnapshot {
     data_heap: Vec<u8>,
     edge_list: Vec<Vec<u64>>,
     embeddings: Vec<Vec<f32>>,
+    clusters: Option<Vec<Cluster>>,
+    cluster_config: ClusterConfig,
 }
 
 /// The main database struct holding all data arenas.
@@ -30,6 +34,10 @@ pub struct SpiderDB {
     embeddings: Vec<Vec<f32>>,
     /// HNSW Index for fast approximate nearest neighbor search.
     index: search::VectorIndex,
+    /// Cached cluster hierarchy
+    clusters: Option<Vec<Cluster>>,
+    /// Clustering configuration
+    cluster_config: ClusterConfig,
     /// Path to the database file.
     file_path: Option<String>,
 }
@@ -68,12 +76,12 @@ impl SpiderDB {
                 embeddings: snapshot.embeddings,
                 index, // Rebuilt index
                 file_path: Some(db_path),
+                clusters: snapshot.clusters,
+                cluster_config: snapshot.cluster_config,
             });
         }
 
         // --- 2. START FRESH (RAM or New File) ---
-        // We don't even need to unwrap here if we pass Options down to search.rs
-        // But for vectors, we usually want to reserve capacity immediately.
         let cap = max_capacity.unwrap_or(1_000_000);
         Ok(SpiderDB {
             headers: Vec::with_capacity(cap),
@@ -82,17 +90,12 @@ impl SpiderDB {
             embeddings: Vec::with_capacity(cap),
             index: search::VectorIndex::new(m, max_capacity, ef_construction),
             file_path: Some(db_path), // Remember the path (even if it doesn't exist yet)
+            clusters: None,
+            cluster_config: ClusterConfig::default(),
         })
     }
 
     /// Adds a new node and AUTOMATICALLY links (bi-directional) it to relevant existing nodes.
-    ///
-    /// # Arguments
-    /// * `content` - Text content.
-    /// * `embedding` - Vector.
-    /// * `significance` - Bio-importance.
-    /// * `auto_link_threshold` (Option<f32>) - If set (e.g., 0.75), automatically creates edges 
-    ///                                          to existing nodes with similarity > threshold.
     pub fn add_node(
         &mut self, 
         content: String, 
@@ -110,7 +113,7 @@ impl SpiderDB {
         // Add to HNSW Index
         self.index.add(id, &embedding);
         
-        // Keep raw embeddings for now (optional, but good for debugging)
+        // Keep raw embeddings for now
         self.embeddings.push(embedding.clone());
 
         // Initialize empty edge list for this new node
@@ -133,7 +136,6 @@ impl SpiderDB {
         self.headers.push(header);
 
         // --- AUTO-LINKING LOGIC ---
-        // Default to 0.8 if not provided.
         let threshold = auto_link_threshold.unwrap_or(0.8);
 
         // Search existing nodes (k=10 to ensure we find valid candidates)
@@ -162,14 +164,94 @@ impl SpiderDB {
         id
     }
 
+    /// Builds or rebuilds the cluster hierarchy
+    pub fn build_clusters(&mut self, k_clusters: Option<usize>) -> PyResult<()> {
+        let k = k_clusters.unwrap_or(10); // Default: 10 root clusters
+        
+        let engine = ClusterEngine::new(self.cluster_config.clone());
+        
+        self.clusters = Some(engine.cluster_graph(
+            &self.headers,
+            &self.embeddings,
+            &self.edge_list,
+            k,
+        ));
+        
+        Ok(())
+    }
+
+    /// Get all clusters (returns simplified structure for Python)
+    pub fn get_clusters(&self) -> Vec<(u64, u64, Vec<u64>, f32)> {
+        match &self.clusters {
+            Some(clusters) => {
+                clusters.iter().map(|c| {
+                    (c.id, c.anchor_node_id, c.member_ids.clone(), c.significance)
+                }).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Find which cluster(s) a node belongs to
+    pub fn get_node_clusters(&self, node_id: u64) -> Vec<u64> {
+        match &self.clusters {
+            Some(clusters) => {
+                let engine = ClusterEngine::new(self.cluster_config.clone());
+                engine.find_node_clusters(node_id, clusters)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Search within a specific cluster
+    pub fn search_in_cluster(
+        &self,
+        cluster_id: u64,
+        query_embedding: Vec<f32>,
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        match &self.clusters {
+            Some(clusters) => {
+                // Find the cluster
+                if let Some(cluster) = clusters.iter().find(|c| c.id == cluster_id) {
+                    let engine = ClusterEngine::new(self.cluster_config.clone());
+                    return engine.cluster_search(&query_embedding, cluster, &self.embeddings, k);
+                }
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Get cluster statistics
+    pub fn get_cluster_stats(&self) -> Option<(usize, f32, f32)> {
+        self.clusters.as_ref().map(|clusters| {
+            let total_clusters = clusters.len();
+            let avg_size = clusters.iter()
+                .map(|c| c.member_ids.len())
+                .sum::<usize>() as f32 / total_clusters as f32;
+            let avg_sig = clusters.iter()
+                .map(|c| c.significance)
+                .sum::<f32>() / total_clusters as f32;
+            
+            (total_clusters, avg_size, avg_sig)
+        })
+    }
+
+    /// Export cluster hierarchy as string (for debugging)
+    pub fn export_cluster_tree(&self) -> String {
+        match &self.clusters {
+            Some(clusters) => {
+                clusters.iter()
+                    .map(|c| crate::cluster::export_cluster_tree(c))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            None => "No clusters built yet. Call build_clusters() first.".to_string(),
+        }
+    }
+
     /// Adds a Bi-directional edge from source to target.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_id` - ID of the source node.
-    /// * `target_id` - ID of the target node.
-    ///
-    /// A -> B AND B -> A === A <-> B
     pub fn add_edge(&mut self, source_id: u64, target_id: u64) {
         if source_id as usize >= self.headers.len() || target_id as usize >= self.headers.len() {
             return;
@@ -219,55 +301,66 @@ impl SpiderDB {
         self.edge_list[id as usize].clone()
     }
 
-    /// Performs a hybrid search combining vector similarity and biological score.
+    /// Performs a hybrid search combining vector similarity, biological score, and cluster awareness.
+    /// It identifies and re-ranks candidates from clusters or HNSW based on a combined score.
     ///
     /// # Arguments
-    ///
-    /// * `query_embedding` - The query vector.
-    /// * `k` - Number of results to return.
+    /// * `query_embedding` - A vector of floats representing the query embedding.
+    /// * `k` - The desired number of top results to return.
+    /// * `ef_search` - An optional parameter for the HNSW search, controlling the size of the
+    ///                 dynamic list of neighbors during search. If `None`, a default is used.
     ///
     /// # Returns
-    ///
-    /// * `Vec<(u64, f32)>` - List of top-k (node_id, score).
-    pub fn hybrid_search(&self, query_embedding: Vec<f32>, k: usize, ef_search: Option<usize>) -> Vec<(u64, f32)> {
-        let min_score = 0.3;
-        // Step 1: Vector Search (The GPS)
-        let similar = self.index.search(&query_embedding, k, ef_search);
-        
-        // Step 2: Graph Traversal (The Expansion)
-        // We collect the matches AND their direct neighbors
-        let mut context_pool = Vec::new();
-        
-        for (id, _score) in similar {
-            context_pool.push(id); 
+    /// A `Vec` of tuples, where each tuple contains a node ID (`u64`) and its
+    /// combined similarity score (`f32`), sorted in descending order of score.
+    pub fn hybrid_search(
+        &mut self, 
+        query_embedding: Vec<f32>, 
+        k: usize, 
+        ef_search: Option<usize>
+    ) -> Vec<(u64, f32)> {
+        let config = ranking::RankConfig::default();
+
+        // 1. Get Candidates (Cluster-aware or Raw Index)
+        let candidates = if self.clusters.is_some() {
+            ranking::find_cluster_candidates(self.clusters.as_ref().unwrap(), &query_embedding, k * 3)
+        } else {
+            self.index.search(&query_embedding, k * 3, ef_search).into_iter().map(|(id, _)| id).collect()
+        };
+
+        // 2. Expand Graph
+        let pool = ranking::expand_with_neighbors(&candidates, &self.edge_list, 2);
+        let mut scored = Vec::new();
+
+        // 3. Score Everything
+        for id in pool {
+            if id as usize >= self.embeddings.len() { continue; }
             
-            // Pull NEIGHBORS, PARENTS (incoming), and CHILDREN (outgoing)
-            if let Some(neighbors) = self.edge_list.get(id as usize) {
-                for &neighbor_id in neighbors {
-                    context_pool.push(neighbor_id);
-                }
+            let semantic = search::cosine_similarity(&query_embedding, &self.embeddings[id as usize]);
+            let graph = ranking::calculate_graph_score(id, &self.edge_list, &self.embeddings, &candidates, &query_embedding);
+            let bio = ranking::calculate_bio_score(&self.headers[id as usize]);
+            let cluster = ranking::calculate_cluster_score(id, self.clusters.as_ref(), &query_embedding);
+
+            let total = (semantic * config.semantic_weight) + 
+                        (graph * config.graph_weight) + 
+                        (bio * config.bio_weight) + 
+                        (cluster * config.cluster_weight);
+
+            if total >= 0.25 {
+                scored.push((id, total));
             }
         }
 
-        // Step 3: Deduplicate
-        context_pool.sort();
-        context_pool.dedup();
-        
-        // Step 4: Rank by Similarity (Cosine)
-        // We calculate the exact cosine similarity for every candidate in the pool.
-        let mut final_results: Vec<(u64, f32)> = context_pool.into_iter().map(|id| {
-            let node_embedding = &self.embeddings[id as usize];
-            let score = search::cosine_similarity(&query_embedding, node_embedding);
-            (id, score)
-        })
-        .filter(|&(_, score)| score >= min_score)
-        .collect();
+        // 4. Sort and Update Access
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let final_results: Vec<(u64, f32)> = scored.into_iter().take(k).collect();
 
-        // Sort desc by Similarity
-        final_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
-        // Return top K
-        final_results.into_iter().take(k).collect()
+        // Update bio-metrics for the winners
+        for (id, _) in &final_results {
+            self.update_node_access(*id);
+        }
+
+        final_results
     }
 
     /// Identifies nodes that should be removed based on their Life Score.
@@ -291,12 +384,7 @@ impl SpiderDB {
     }
 
     /// Saves the database.
-    ///
-    /// # Arguments
-    /// * `path` (Optional) - If provided, saves to this new path.
-    ///                       If None, saves to the path provided at init.
     pub fn save(&self, path: Option<String>) -> PyResult<()> {
-        // Determine target path: Argument > Init Path > Error
         let target_path = match path {
             Some(p) => p,
             None => match &self.file_path {
@@ -310,6 +398,8 @@ impl SpiderDB {
             data_heap: self.data_heap.clone(),
             edge_list: self.edge_list.clone(),
             embeddings: self.embeddings.clone(),
+            clusters: self.clusters.clone(),
+            cluster_config: self.cluster_config.clone(),
         };
 
         let file = File::create(&target_path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -322,12 +412,24 @@ impl SpiderDB {
     }
 
     /// Exports the entire graph for visualization.
-    /// Returns a tuple: (nodes, edges)
-    /// - nodes: List of (id, label, significance)
-    /// - edges: List of (source_id, target_id)
-    pub fn get_all_graph_data(&self) -> (Vec<(u64, String, u8)>, Vec<(u64, u64)>) {
+    pub fn get_all_graph_data(&self) -> (Vec<(u64, String, u8, Option<u64>)>, Vec<(u64, u64)>) {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
+
+        // 0. Build Node -> Cluster Map
+        let mut node_cluster_map = std::collections::HashMap::new();
+        if let Some(clusters) = &self.clusters {
+             // Helper to recursively map
+             fn map_clusters(clusters: &[Cluster], map: &mut std::collections::HashMap<u64, u64>) {
+                 for c in clusters {
+                     for &member in &c.member_ids {
+                         map.insert(member, c.id);
+                     }
+                     map_clusters(&c.sub_clusters, map);
+                 }
+             }
+             map_clusters(clusters, &mut node_cluster_map);
+        }
 
         // 1. Collect Nodes
         for header in &self.headers {
@@ -344,7 +446,8 @@ impl SpiderDB {
                 format!("Node {}", header.id)
             };
             
-            nodes.push((header.id, label, header.significance));
+            let cluster_id = node_cluster_map.get(&header.id).copied();
+            nodes.push((header.id, label, header.significance, cluster_id));
         }
 
         // 2. Collect Edges
@@ -357,5 +460,21 @@ impl SpiderDB {
         }
 
         (nodes, edges)
+    }
+}
+
+impl SpiderDB {
+    /// Update access metrics when a node is retrieved
+    fn update_node_access(&mut self, node_id: u64) {
+        if node_id as usize >= self.headers.len() {
+            return;
+        }
+
+        let header = &mut self.headers[node_id as usize];
+        header.access_count += 1;
+        header.last_access_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
     }
 }
