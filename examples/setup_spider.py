@@ -112,7 +112,7 @@ def main():
     print("\n--- Testing Graph & Clustering ---")
     
     # Force cluster build (Calls src/cluster.rs logic)
-    db.build_clusters(k_clusters=3)
+    db.build_clusters(k_clusters=6)
     print("Clusters built.")
     
     # 4. Save to Disk
