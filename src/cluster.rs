@@ -30,7 +30,7 @@ impl Default for ClusterConfig {
             min_cluster_size: 3,
             max_cluster_size: 50,
             max_depth: 3,
-            similarity_threshold: 0.45,
+            similarity_threshold: 0.20,
         }
     }
 }
@@ -43,188 +43,6 @@ pub struct ClusterEngine {
 impl ClusterEngine {
     pub fn new(config: ClusterConfig) -> Self {
         ClusterEngine { config }
-    }
-
-    /// Step 1: Find anchor nodes (cluster centers)
-    /// Uses high-significance + high-access-count nodes
-    pub fn find_anchors(
-        &self,
-        headers: &[NodeHeader],
-        embeddings: &[Vec<f32>],
-        k_clusters: usize,
-    ) -> Vec<u64> {
-        // Score nodes by bio-metrics
-        let mut scored_nodes: Vec<(u64, f32)> = headers
-            .iter()
-            .map(|h| {
-                let bio_score = (h.access_count as f32 * 0.3) 
-                              + (h.significance as f32 * 0.7);
-                (h.id, bio_score)
-            })
-            .collect();
-
-        // Sort by score descending
-        scored_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // Take top K, but ensure diversity (not too similar to each other)
-        let mut anchors = Vec::new();
-        let min_anchor_distance = 0.3;
-
-        for (node_id, _score) in scored_nodes {
-            if anchors.len() >= k_clusters {
-                break;
-            }
-
-            let node_emb = &embeddings[node_id as usize];
-            let mut too_close = false;
-
-            // Check if this candidate is too similar to existing anchors
-            for &anchor_id in &anchors {
-                let anchor_emb = &embeddings[anchor_id as usize];
-                let sim = search::cosine_similarity(node_emb, anchor_emb);
-                if sim > (1.0 - min_anchor_distance) {
-                    too_close = true;
-                    break;
-                }
-            }
-
-            if !too_close {
-                anchors.push(node_id);
-            }
-        }
-
-        anchors
-    }
-
-    /// Step 2: Assign nodes to clusters using graph + vector similarity
-    pub fn assign_to_clusters(
-        &self,
-        anchors: &[u64],
-        embeddings: &[Vec<f32>],
-        edge_list: &[Vec<u64>],
-    ) -> HashMap<u64, Vec<u64>> {
-        let mut clusters: HashMap<u64, Vec<u64>> = HashMap::new();
-        
-        // Initialize clusters
-        for &anchor_id in anchors {
-            clusters.insert(anchor_id, vec![anchor_id]);
-        }
-
-        // Assign each node to nearest anchor
-        for (node_id, node_emb) in embeddings.iter().enumerate() {
-            if anchors.contains(&(node_id as u64)) {
-                continue; // Skip anchors themselves
-            }
-
-            // Find best anchor
-            let mut best_anchor = anchors[0];
-            let mut best_score = f32::MIN;
-
-            for &anchor_id in anchors {
-                let anchor_emb = &embeddings[anchor_id as usize];
-                
-                // Vector similarity
-                let vec_sim = search::cosine_similarity(node_emb, anchor_emb);
-                
-                // Graph proximity (bonus if connected)
-                let graph_bonus = if edge_list[node_id].contains(&anchor_id) {
-                    0.2
-                } else {
-                    0.0
-                };
-
-                let total_score = vec_sim + graph_bonus;
-
-                if total_score > best_score {
-                    best_score = total_score;
-                    best_anchor = anchor_id;
-                }
-            }
-
-            // Only assign if similarity is above threshold
-            if best_score > self.config.similarity_threshold {
-                clusters.get_mut(&best_anchor).unwrap().push(node_id as u64);
-            }
-        }
-
-        clusters
-    }
-
-    /// Step 3: Build hierarchical clusters (recursive sub-clustering)
-    pub fn build_hierarchy(
-        &self,
-        cluster_members: Vec<u64>,
-        anchor_id: u64,
-        embeddings: &[Vec<f32>],
-        edge_list: &[Vec<u64>],
-        headers: &[NodeHeader],
-        depth: usize,
-        cluster_id_counter: &mut u64,
-    ) -> Cluster {
-        let centroid = self.calculate_centroid(&cluster_members, embeddings);
-        let avg_significance = cluster_members
-            .iter()
-            .map(|&id| headers[id as usize].significance as f32)
-            .sum::<f32>() / cluster_members.len() as f32;
-
-        // Assign a new sequential ID
-        let current_cluster_id = *cluster_id_counter;
-        *cluster_id_counter += 1;
-
-        // Base case: Stop if too small or max depth reached
-        if cluster_members.len() <= self.config.min_cluster_size 
-           || depth >= self.config.max_depth {
-            return Cluster {
-                id: current_cluster_id,
-                anchor_node_id: anchor_id,
-                member_ids: cluster_members,
-                centroid,
-                significance: avg_significance,
-                sub_clusters: Vec::new(),
-                depth,
-            };
-        }
-
-        // Recursive case: Create sub-clusters
-        let num_sub_clusters = (cluster_members.len() / self.config.max_cluster_size)
-            .max(2)
-            .min(5); // 2-5 sub-clusters
-
-        let sub_anchors = self.find_anchors(
-            &headers[..cluster_members.len()],
-            embeddings,
-            num_sub_clusters,
-        );
-
-        let sub_cluster_assignments = self.assign_to_clusters(
-            &sub_anchors,
-            embeddings,
-            edge_list,
-        );
-
-        let mut sub_clusters = Vec::new();
-        for (sub_anchor, sub_members) in sub_cluster_assignments {
-            let sub_cluster = self.build_hierarchy(
-                sub_members,
-                sub_anchor,
-                embeddings,
-                edge_list,
-                headers,
-                depth + 1,
-                cluster_id_counter,
-            );
-            sub_clusters.push(sub_cluster);
-        }
-
-        Cluster {
-            id: current_cluster_id,
-            anchor_node_id: anchor_id,
-            member_ids: cluster_members,
-            centroid,
-            significance: avg_significance,
-            sub_clusters,
-            depth,
-        }
     }
 
     /// Calculate centroid (average embedding) for a cluster
@@ -251,41 +69,243 @@ impl ClusterEngine {
         centroid
     }
 
-    /// Main entry point: Cluster the entire graph
-    pub fn cluster_graph(
+    /// Calculate average linkage distance between two clusters
+    fn average_linkage_distance(
         &self,
-        headers: &[NodeHeader],
+        cluster_a: &[u64],
+        cluster_b: &[u64],
         embeddings: &[Vec<f32>],
-        edge_list: &[Vec<u64>],
+    ) -> f32 {
+        if cluster_a.is_empty() || cluster_b.is_empty() {
+            return 0.0;
+        }
+
+        let mut total_sim = 0.0;
+        let mut count = 0;
+
+        for &id_a in cluster_a {
+            for &id_b in cluster_b {
+                let sim = search::cosine_similarity(
+                    &embeddings[id_a as usize],
+                    &embeddings[id_b as usize],
+                );
+                total_sim += sim;
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            total_sim / count as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// Agglomerative Hierarchical Clustering with Average Linkage
+    /// Bottom-up approach: start with each node as its own cluster, merge closest pairs
+    pub fn agglomerative_cluster(
+        &self,
+        embeddings: &[Vec<f32>],
         k_clusters: usize,
-    ) -> Vec<Cluster> {
-        // Step 1: Find root-level anchors
-        let anchors = self.find_anchors(headers, embeddings, k_clusters);
+    ) -> Vec<Vec<u64>> {
+        let n = embeddings.len();
+        if n == 0 {
+            return vec![];
+        }
+        if n <= k_clusters {
+            return (0..n as u64).map(|id| vec![id]).collect();
+        }
 
-        // Step 2: Assign nodes to clusters
-        let cluster_assignments = self.assign_to_clusters(&anchors, embeddings, edge_list);
+        // Initialize: each node is its own cluster
+        let mut clusters: Vec<Vec<u64>> = (0..n as u64).map(|id| vec![id]).collect();
 
-        // Step 3: Build hierarchy for each cluster
-        let mut clusters = Vec::new();
-        let mut cluster_id_counter = 0;
+        // Precompute similarity matrix (only upper triangle)
+        let mut sim_matrix: Vec<Vec<f32>> = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let sim = search::cosine_similarity(&embeddings[i], &embeddings[j]);
+                sim_matrix[i][j] = sim;
+                sim_matrix[j][i] = sim;
+            }
+        }
 
-        for (anchor_id, members) in cluster_assignments {
-            let cluster = self.build_hierarchy(
-                members,
-                anchor_id,
-                embeddings,
-                edge_list,
-                headers,
-                0, // Root depth
-                &mut cluster_id_counter,
-            );
-            clusters.push(cluster);
+        // Merge until we have k_clusters
+        while clusters.len() > k_clusters {
+            // Find the two most similar clusters
+            let mut best_i = 0;
+            let mut best_j = 1;
+            let mut best_sim = f32::MIN;
+
+            for i in 0..clusters.len() {
+                for j in (i + 1)..clusters.len() {
+                    let sim = self.average_linkage_distance(&clusters[i], &clusters[j], embeddings);
+                    if sim > best_sim {
+                        best_sim = sim;
+                        best_i = i;
+                        best_j = j;
+                    }
+                }
+            }
+
+            // Merge clusters[best_j] into clusters[best_i]
+            // Important: remove best_j first since it's higher index
+            // Then best_i index is still valid
+            let merged = clusters.remove(best_j);
+            // After removing best_j, if best_i > best_j, best_i is now best_i-1
+            // But since our loop ensures best_i < best_j, this is already correct
+            clusters[best_i].extend(merged);
         }
 
         clusters
     }
 
-    /// Find which cluster(s) a node belongs to (can be multiple)
+    /// Find the best anchor (representative node) for a cluster
+    fn find_cluster_anchor(
+        &self,
+        members: &[u64],
+        embeddings: &[Vec<f32>],
+        headers: &[NodeHeader],
+    ) -> u64 {
+        if members.is_empty() {
+            return 0;
+        }
+
+        // Calculate centroid of the cluster
+        let centroid = self.calculate_centroid(members, embeddings);
+
+        // Find the member closest to centroid with high significance
+        let mut best_anchor = members[0];
+        let mut best_score = f32::MIN;
+
+        for &id in members {
+            let sim_to_centroid = search::cosine_similarity(
+                &embeddings[id as usize],
+                &centroid,
+            );
+            let significance = headers[id as usize].significance as f32 / 9.0;
+            
+            // Combined score: closeness to centroid + significance
+            let score = sim_to_centroid * 0.7 + significance * 0.3;
+            
+            if score > best_score {
+                best_score = score;
+                best_anchor = id;
+            }
+        }
+
+        best_anchor
+    }
+
+    /// Build hierarchical cluster structure from flat clusters
+    fn build_cluster_hierarchy(
+        &self,
+        flat_clusters: Vec<Vec<u64>>,
+        embeddings: &[Vec<f32>],
+        headers: &[NodeHeader],
+        cluster_id_counter: &mut u64,
+        depth: usize,
+    ) -> Vec<Cluster> {
+        let mut result = Vec::new();
+
+        for members in flat_clusters {
+            if members.is_empty() {
+                continue;
+            }
+
+            let id = *cluster_id_counter;
+            *cluster_id_counter += 1;
+
+            let anchor = self.find_cluster_anchor(&members, embeddings, headers);
+            let centroid = self.calculate_centroid(&members, embeddings);
+            let avg_significance = members.iter()
+                .map(|&id| headers[id as usize].significance as f32)
+                .sum::<f32>() / members.len() as f32;
+
+            // Build sub-clusters if cluster is large enough
+            let sub_clusters = if members.len() > self.config.max_cluster_size 
+                                  && depth < self.config.max_depth {
+                // Create filtered embeddings for sub-clustering
+                let sub_k = (members.len() / self.config.min_cluster_size).max(2).min(5);
+                let sub_flat = self.agglomerative_cluster_subset(&members, embeddings, sub_k);
+                self.build_cluster_hierarchy(sub_flat, embeddings, headers, cluster_id_counter, depth + 1)
+            } else {
+                Vec::new()
+            };
+
+            result.push(Cluster {
+                id,
+                anchor_node_id: anchor,
+                member_ids: members,
+                centroid,
+                significance: avg_significance,
+                sub_clusters,
+                depth,
+            });
+        }
+
+        result
+    }
+
+    /// Agglomerative clustering on a subset of nodes
+    fn agglomerative_cluster_subset(
+        &self,
+        subset_ids: &[u64],
+        embeddings: &[Vec<f32>],
+        k_clusters: usize,
+    ) -> Vec<Vec<u64>> {
+        let n = subset_ids.len();
+        if n <= k_clusters {
+            return subset_ids.iter().map(|&id| vec![id]).collect();
+        }
+
+        // Initialize: each node is its own cluster
+        let mut clusters: Vec<Vec<u64>> = subset_ids.iter().map(|&id| vec![id]).collect();
+
+        // Merge until we have k_clusters
+        while clusters.len() > k_clusters {
+            let mut best_i = 0;
+            let mut best_j = 1;
+            let mut best_sim = f32::MIN;
+
+            for i in 0..clusters.len() {
+                for j in (i + 1)..clusters.len() {
+                    let sim = self.average_linkage_distance(&clusters[i], &clusters[j], embeddings);
+                    if sim > best_sim {
+                        best_sim = sim;
+                        best_i = i;
+                        best_j = j;
+                    }
+                }
+            }
+
+            let merged = clusters.remove(best_j);
+            clusters[best_i].extend(merged);
+        }
+
+        clusters
+    }
+
+    /// Main entry point: Cluster the entire graph using agglomerative clustering
+    pub fn cluster_graph(
+        &self,
+        headers: &[NodeHeader],
+        embeddings: &[Vec<f32>],
+        _edge_list: &[Vec<u64>],  // Kept for API compatibility, could be used for graph-aware clustering
+        k_clusters: usize,
+    ) -> Vec<Cluster> {
+        if embeddings.is_empty() {
+            return vec![];
+        }
+
+        // Step 1: Perform agglomerative clustering
+        let flat_clusters = self.agglomerative_cluster(embeddings, k_clusters);
+
+        // Step 2: Build hierarchical structure with anchors and metadata
+        let mut cluster_id_counter = 0u64;
+        self.build_cluster_hierarchy(flat_clusters, embeddings, headers, &mut cluster_id_counter, 0)
+    }
+
+    /// Find which cluster(s) a node belongs to (can be multiple due to hierarchy)
     pub fn find_node_clusters(&self, node_id: u64, clusters: &[Cluster]) -> Vec<u64> {
         let mut result = Vec::new();
         
@@ -321,6 +341,35 @@ impl ClusterEngine {
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         results.into_iter().take(k).collect()
+    }
+
+    /// Calculate cluster cohesion (average intra-cluster similarity)
+    pub fn calculate_cohesion(&self, cluster: &Cluster, embeddings: &[Vec<f32>]) -> f32 {
+        if cluster.member_ids.len() <= 1 {
+            return 1.0; // Single node cluster is perfectly cohesive
+        }
+
+        let mut total_sim = 0.0;
+        let mut count = 0;
+
+        for i in 0..cluster.member_ids.len() {
+            for j in (i + 1)..cluster.member_ids.len() {
+                let id_a = cluster.member_ids[i];
+                let id_b = cluster.member_ids[j];
+                let sim = search::cosine_similarity(
+                    &embeddings[id_a as usize],
+                    &embeddings[id_b as usize],
+                );
+                total_sim += sim;
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            total_sim / count as f32
+        } else {
+            1.0
+        }
     }
 }
 
