@@ -154,23 +154,19 @@ impl SpiderDB {
         self.headers.push(header);
 
         // --- AUTO-LINKING LOGIC ---
-        let threshold = auto_link_threshold.unwrap_or(0.8);
+        let threshold = auto_link_threshold.unwrap_or(0.6);
+
+        let max_neighbors = 5;
 
         // Search existing nodes (k=10 to ensure we find valid candidates)
-        let similar_nodes = self.index.search(&embedding, 10, Some(64)); 
+        let similar_nodes = self.index.search(&embedding, max_neighbors + 1, Some(64)); 
 
         let mut edges_to_add = Vec::new();
-        let max_auto_links = 3; // <--- LIMIT TO TOP 3
 
         for (neighbor_id, similarity) in similar_nodes {
             // Don't link to self, and only link if similarity is strong enough
             if neighbor_id != id && similarity >= threshold {
                 edges_to_add.push(neighbor_id);
-                
-                // Stop if we have enough links
-                if edges_to_add.len() >= max_auto_links {
-                    break;
-                }
             }
         }
 
